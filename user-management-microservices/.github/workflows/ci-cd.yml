@@ -1,0 +1,171 @@
+name: CI/CD Pipeline for Microservices
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  USER_SERVICE_IMAGE: user-service
+  AUTH_SERVICE_IMAGE: auth-service
+
+jobs:
+  # Job 1: Build and Test
+  build-and-test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: |
+          user-service/package-lock.json
+          auth-service/package-lock.json
+    
+    # Build and test User Service
+    - name: Install User Service dependencies
+      working-directory: ./user-service
+      run: npm ci
+    
+    - name: Build User Service
+      working-directory: ./user-service
+      run: npm run start &
+      env:
+        CI: true
+    
+    # Build and test Auth Service
+    - name: Install Auth Service dependencies
+      working-directory: ./auth-service
+      run: npm ci
+    
+    - name: Build Auth Service
+      working-directory: ./auth-service
+      run: npm run start &
+      env:
+        CI: true
+    
+    - name: Wait for services to start
+      run: sleep 10
+    
+    - name: Health check User Service
+      run: |
+        timeout 30 bash -c 'until curl -f http://localhost:3001/health; do sleep 2; done'
+    
+    - name: Health check Auth Service
+      run: |
+        timeout 30 bash -c 'until curl -f http://localhost:3002/health; do sleep 2; done'
+
+  # Job 2: Build Docker Images
+  build-images:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    outputs:
+      user-service-image: ${{ steps.meta-user.outputs.tags }}
+      auth-service-image: ${{ steps.meta-auth.outputs.tags }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    # Build and push User Service image
+    - name: Extract metadata for User Service
+      id: meta-user
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.USER_SERVICE_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push User Service
+      uses: docker/build-push-action@v5
+      with:
+        context: ./user-service
+        push: true
+        tags: ${{ steps.meta-user.outputs.tags }}
+        labels: ${{ steps.meta-user.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+    
+    # Build and push Auth Service image
+    - name: Extract metadata for Auth Service
+      id: meta-auth
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.AUTH_SERVICE_IMAGE }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest,enable={{is_default_branch}}
+    
+    - name: Build and push Auth Service
+      uses: docker/build-push-action@v5
+      with:
+        context: ./auth-service
+        push: true
+        tags: ${{ steps.meta-auth.outputs.tags }}
+        labels: ${{ steps.meta-auth.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Job 3: Deploy to Development
+  deploy-dev:
+    needs: build-images
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: development
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to Development
+      run: |
+        echo "Deploying to Development Environment"
+        echo "User Service Image: ${{ needs.build-images.outputs.user-service-image }}"
+        echo "Auth Service Image: ${{ needs.build-images.outputs.auth-service-image }}"
+        # Add your deployment commands here (e.g., kubectl, docker-compose, etc.)
+
+  # Job 4: Deploy to Production
+  deploy-prod:
+    needs: build-images
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Deploy to Production
+      run: |
+        echo "Deploying to Production Environment"
+        echo "User Service Image: ${{ needs.build-images.outputs.user-service-image }}"
+        echo "Auth Service Image: ${{ needs.build-images.outputs.auth-service-image }}"
+        # Add your production deployment commands here
